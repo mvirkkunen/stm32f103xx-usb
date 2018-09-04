@@ -133,7 +133,7 @@ impl ::usb_device::bus::UsbBus for UsbBus {
     }
 
     fn enable(&mut self) {
-        //self.reset.freeze();
+        self.reset.freeze();
 
         let mut max = 0;
         for (index, ep) in self.endpoints.iter().enumerate() {

@@ -177,10 +177,10 @@ fn main() -> ! {
 
     assert!(clocks.usbclk_valid());
 
-    let usb_bus = UsbBus::usb(dp.USB, &mut rcc.apb1);
+    let mut gpioa = dp.GPIOA.split(&mut rcc.apb2);
 
-    //let mut gpioa = dp.GPIOA.split(&mut rcc.apb2);
-    //usb_bus.resetter(&clocks, &mut gpioa.crh, gpioa.pa12).reset();
+    let usb_bus = UsbBus::usb(dp.USB, &mut rcc.apb1);
+    usb_bus.borrow_mut().enable_reset(&clocks, &mut gpioa.crh, gpioa.pa12);
 
     let serial = cdc_acm::SerialPort::new(&usb_bus);
 
@@ -190,6 +190,8 @@ fn main() -> ! {
         .serial_number("TEST")
         .device_class(cdc_acm::USB_CLASS_CDC)
         .build(&[&serial]);
+
+    usb_dev.force_reset().expect("reset failed");
 
     loop {
         usb_dev.poll();

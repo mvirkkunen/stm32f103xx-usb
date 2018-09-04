@@ -83,7 +83,7 @@ fn main() -> ! {
     let mut led = gpioc.pc13.into_push_pull_output(&mut gpioc.crh);
 
     let usb_bus = UsbBus::usb(dp.USB, &mut rcc.apb1);
-    usb_bus.resetter(&clocks, &mut gpioa.crh, gpioa.pa12).reset();
+    usb_bus.borrow_mut().enable_reset(&clocks, &mut gpioa.crh, gpioa.pa12);
 
     let custom = example::CustomClass::new();
 
@@ -91,6 +91,8 @@ fn main() -> ! {
         .manufacturer("Fake company")
         .product("My device")
         .build(&[&custom]);
+
+    usb_dev.force_reset().expect("reset failed");
 
     loop {
         // Could be in an interrupt

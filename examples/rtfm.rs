@@ -8,6 +8,9 @@ extern crate panic_semihosting;
 extern crate usb_device;
 extern crate stm32f103xx_usb;
 
+use usb_device::prelude::*;
+
+static DEV: Option<UsbDevice<stm32f103xx_usb::UsbBus>> = None;
 static BUS: Option<stm32f103xx_usb::UsbBus> = None;
 
 entry!(main);
