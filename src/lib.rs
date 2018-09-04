@@ -16,4 +16,5 @@ mod regs;
 
 /// USB peripheral driver.
 pub mod bus;
+
 pub use bus::UsbBus;

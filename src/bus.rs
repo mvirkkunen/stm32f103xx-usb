@@ -1,13 +1,15 @@
-use core::cell::{Cell, RefCell};
+//use core::cell::{Cell, RefCell};
 use usb_device::{Result, UsbError};
-use usb_device::bus::{UsbAllocator, UsbAllocatorState, PollResult};
+use usb_device::bus::{UsbBusWrapper, PollResult};
 use usb_device::endpoint::{EndpointDirection, EndpointType};
 use cortex_m::asm::delay;
+use cortex_m::interrupt;
 use stm32f103xx::{USB, usb};
 use stm32f103xx_hal::prelude::*;
 use stm32f103xx_hal::rcc;
 use stm32f103xx_hal::gpio::{self, gpioa};
 use regs::{NUM_ENDPOINTS, PacketMemory, EpReg, EndpointStatus, calculate_count_rx};
+use usb_device::utils::FreezableRefCell;
 
 #[derive(Default)]
 struct EndpointRecord {
@@ -19,31 +21,29 @@ struct EndpointRecord {
 /// USB peripheral driver for STM32F103 microcontrollers.
 pub struct UsbBus {
     regs: USB,
-    packet_mem: RefCell<PacketMemory>,
-    max_endpoint: Cell<Option<usize>>,
-    endpoints: RefCell<[EndpointRecord; NUM_ENDPOINTS]>,
-    allocator_state: UsbAllocatorState
+    packet_mem: FreezableRefCell<PacketMemory>,
+    max_endpoint: FreezableRefCell<usize>,
+    endpoints: FreezableRefCell<[EndpointRecord; NUM_ENDPOINTS]>,
 }
 
 impl UsbBus {
     /// Constructs a new USB peripheral driver.
-    pub fn usb(regs: USB, apb1: &mut rcc::APB1) -> UsbBus {
+    pub fn usb(regs: USB, apb1: &mut rcc::APB1) -> UsbBusWrapper<Self> {
         // TODO: apb1.enr is not public, figure out how this should really interact with the HAL
         // crate
 
         let _ = apb1;
-        ::cortex_m::interrupt::free(|_| {
+        interrupt::free(|_| {
             let dp = unsafe { ::stm32f103xx::Peripherals::steal() };
             dp.RCC.apb1enr.modify(|_, w| w.usben().enabled());
         });
 
-        UsbBus {
+        UsbBusWrapper::new(UsbBus {
             regs,
-            packet_mem: RefCell::new(PacketMemory::new()),
-            max_endpoint: Cell::new(None),
-            endpoints: RefCell::default(),
-            allocator_state: Default::default(),
-        }
+            packet_mem: FreezableRefCell::new(PacketMemory::new()),
+            max_endpoint: FreezableRefCell::default(),
+            endpoints: FreezableRefCell::default(),
+        })
     }
 
     /// Gets an `UsbBusResetter` which can be used to force a USB reset and re-enumeration from the
@@ -62,29 +62,15 @@ impl UsbBus {
         }
     }
 
-    /// Gets the `UsbAllocator` for this `UsbBus`.
-    pub fn allocator<'a>(&'a self) -> UsbAllocator<'a, Self> {
-        // Convenience method so user doesn't have to use usb_device::UsbBus to use this method
-        ::usb_device::bus::UsbBus::allocator(self)
-    }
-
     fn ep_regs(&self) -> &'static [EpReg; NUM_ENDPOINTS] {
         return unsafe { &*(&self.regs.ep0r as *const usb::EP0R as *const EpReg as *const [EpReg; NUM_ENDPOINTS]) };
     }
 }
 
 impl ::usb_device::bus::UsbBus for UsbBus {
-    fn allocator_state<'a>(&'a self) -> &'a UsbAllocatorState {
-        &self.allocator_state
-    }
-
     fn alloc_ep(&self, ep_dir: EndpointDirection, ep_addr: Option<u8>, ep_type: EndpointType,
         max_packet_size: u16, _interval: u8) -> Result<u8>
     {
-        if self.max_endpoint.get().is_some() {
-            return Err(UsbError::Busy);
-        }
-
         let mut pmem = self.packet_mem.borrow_mut();
         let mut endpoints = self.endpoints.borrow_mut();
 
@@ -150,7 +136,10 @@ impl ::usb_device::bus::UsbBus for UsbBus {
             }
         }
 
-        self.max_endpoint.set(Some(max));
+        *self.max_endpoint.borrow_mut() = max;
+
+        self.max_endpoint.freeze();
+        self.endpoints.freeze();
 
         self.regs.cntr.modify(|_, w| w.pdwn().clear_bit());
 
@@ -221,7 +210,7 @@ impl ::usb_device::bus::UsbBus for UsbBus {
             let mut ep_setup = 0;
             let mut bit = 1;
 
-            for reg in &self.ep_regs()[0..=self.max_endpoint.get().unwrap()] {
+            for reg in &self.ep_regs()[0..=*self.max_endpoint.borrow()] {
                 let v = reg.read();
 
                 if v.ctr_rx().bit_is_set() {
@@ -315,37 +304,45 @@ impl ::usb_device::bus::UsbBus for UsbBus {
     }
 
     fn stall(&self, ep: u8) {
-        if ep & 0x80 != 0 {
-            self.ep_regs()[(ep & !0x80) as usize].set_stat_tx(EndpointStatus::Stall);
-        } else {
-            self.ep_regs()[ep as usize].set_stat_rx(EndpointStatus::Stall);
+        interrupt::free(|_| {
+            if ep & 0x80 != 0 {
+                self.ep_regs()[(ep & !0x80) as usize].set_stat_tx(EndpointStatus::Stall);
+            } else {
+                self.ep_regs()[ep as usize].set_stat_rx(EndpointStatus::Stall);
+            }
         }
     }
 
     fn unstall(&self, ep: u8) {
-        let reg = &self.ep_regs()[(ep & !0x80) as usize];
+        interrupt::free(|_| {
+            let reg = &self.ep_regs()[(ep & !0x80) as usize];
 
-        if ep & 0x80 != 0 {
-            if reg.read().stat_tx().bits() == EndpointStatus::Stall as u8 {
-                reg.set_stat_tx(EndpointStatus::Nak);
-            }
-        } else {
-            if reg.read().stat_rx().bits() == EndpointStatus::Stall as u8 {
-                reg.set_stat_rx(EndpointStatus::Valid);
+            if ep & 0x80 != 0 {
+                if reg.read().stat_tx().bits() == EndpointStatus::Stall as u8 {
+                    reg.set_stat_tx(EndpointStatus::Nak);
+                }
+            } else {
+                if reg.read().stat_rx().bits() == EndpointStatus::Stall as u8 {
+                    reg.set_stat_rx(EndpointStatus::Valid);
+                }
             }
         }
     }
 
     fn suspend(&self) {
-        self.regs.cntr.modify(|_, w| w
-            .fsusp().set_bit()
-            .lpmode().set_bit());
+        interrupt::free(|_| {
+            self.regs.cntr.modify(|_, w| w
+                .fsusp().set_bit()
+                .lpmode().set_bit());
+        }
     }
 
     fn resume(&self) {
-        self.regs.cntr.modify(|_, w| w
-            .fsusp().clear_bit()
-            .lpmode().clear_bit());
+        interrupt::free(|_| {
+            self.regs.cntr.modify(|_, w| w
+                .fsusp().clear_bit()
+                .lpmode().clear_bit());
+        });
     }
 }
 

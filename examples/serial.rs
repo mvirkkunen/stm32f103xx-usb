@@ -53,13 +53,13 @@ mod cdc_acm {
     }
 
     impl<'a, B: UsbBus> SerialPort<'a, B> {
-        pub fn new(alloc: &UsbAllocator<'a, B>) -> SerialPort<'a, B> {
+        pub fn new(bus: &'a UsbBusWrapper<B>) -> SerialPort<'a, B> {
             SerialPort {
-                comm_if: alloc.interface(),
-                comm_ep: alloc.interrupt(8, 255),
-                data_if: alloc.interface(),
-                read_ep: alloc.bulk(64),
-                write_ep: alloc.bulk(64),
+                comm_if: bus.interface(),
+                comm_ep: bus.interrupt(8, 255),
+                data_if: bus.interface(),
+                read_ep: bus.bulk(64),
+                write_ep: bus.bulk(64),
                 read_buf: RefCell::new(Buf {
                     buf: [0; 64],
                     len: 0,
@@ -179,10 +179,10 @@ fn main() -> ! {
 
     let usb_bus = UsbBus::usb(dp.USB, &mut rcc.apb1);
 
-    let mut gpioa = dp.GPIOA.split(&mut rcc.apb2);
-    usb_bus.resetter(&clocks, &mut gpioa.crh, gpioa.pa12).reset();
+    //let mut gpioa = dp.GPIOA.split(&mut rcc.apb2);
+    //usb_bus.resetter(&clocks, &mut gpioa.crh, gpioa.pa12).reset();
 
-    let serial = cdc_acm::SerialPort::new(&usb_bus.allocator());
+    let serial = cdc_acm::SerialPort::new(&usb_bus);
 
     let usb_dev = UsbDevice::new(&usb_bus, UsbVidPid(0x5824, 0x27dd))
         .manufacturer("Fake company")
