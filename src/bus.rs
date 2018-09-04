@@ -1,7 +1,8 @@
-//use core::cell::{Cell, RefCell};
+use core::cell::RefCell;
 use usb_device::{Result, UsbError};
 use usb_device::bus::{UsbBusWrapper, PollResult};
 use usb_device::endpoint::{EndpointDirection, EndpointType};
+use usb_device::utils::FreezableRefCell;
 use cortex_m::asm::delay;
 use cortex_m::interrupt;
 use stm32f103xx::{USB, usb};
@@ -9,7 +10,7 @@ use stm32f103xx_hal::prelude::*;
 use stm32f103xx_hal::rcc;
 use stm32f103xx_hal::gpio::{self, gpioa};
 use regs::{NUM_ENDPOINTS, PacketMemory, EpReg, EndpointStatus, calculate_count_rx};
-use usb_device::utils::FreezableRefCell;
+use utils::SyncWrapper;
 
 #[derive(Default)]
 struct EndpointRecord {
@@ -18,12 +19,18 @@ struct EndpointRecord {
     in_valid: bool,
 }
 
+struct Reset {
+    delay: u32,
+    pin: RefCell<gpioa::PA12<gpio::Output<gpio::PushPull>>>,
+}
+
 /// USB peripheral driver for STM32F103 microcontrollers.
 pub struct UsbBus {
-    regs: USB,
-    packet_mem: FreezableRefCell<PacketMemory>,
-    max_endpoint: FreezableRefCell<usize>,
-    endpoints: FreezableRefCell<[EndpointRecord; NUM_ENDPOINTS]>,
+    regs: SyncWrapper<USB>,
+    packet_mem: PacketMemory,
+    max_endpoint: usize,
+    endpoints: [EndpointRecord; NUM_ENDPOINTS],
+    reset: FreezableRefCell<Option<Reset>>,
 }
 
 impl UsbBus {
@@ -39,10 +46,11 @@ impl UsbBus {
         });
 
         UsbBusWrapper::new(UsbBus {
-            regs,
-            packet_mem: FreezableRefCell::new(PacketMemory::new()),
-            max_endpoint: FreezableRefCell::default(),
-            endpoints: FreezableRefCell::default(),
+            regs: unsafe { SyncWrapper::new(regs) },
+            packet_mem: PacketMemory::new(),
+            max_endpoint: 0,
+            endpoints: Default::default(),
+            reset: FreezableRefCell::default(),
         })
     }
 
@@ -52,14 +60,13 @@ impl UsbBus {
     /// This is a potentially out-of-spec hack useful mainly for development. Force a reset at the
     /// start of your program to get the host to re-enumerate your device after flashing new
     /// changes.
-    pub fn resetter<'a, M>(&'a self,
-        clocks: &rcc::Clocks, crh: &mut gpioa::CRH, pa12: gpioa::PA12<M>) -> UsbBusResetter<'a>
+    pub fn enable_reset<M>(&mut self,
+        clocks: &rcc::Clocks, crh: &mut gpioa::CRH, pa12: gpioa::PA12<M>)
     {
-        UsbBusResetter {
-            bus: self,
+        *self.reset.borrow_mut() = Some(Reset {
             delay: clocks.sysclk().0,
-            pa12: pa12.into_push_pull_output(crh),
-        }
+            pin: RefCell::new(pa12.into_push_pull_output(crh)),
+        });
     }
 
     fn ep_regs(&self) -> &'static [EpReg; NUM_ENDPOINTS] {
@@ -68,12 +75,9 @@ impl UsbBus {
 }
 
 impl ::usb_device::bus::UsbBus for UsbBus {
-    fn alloc_ep(&self, ep_dir: EndpointDirection, ep_addr: Option<u8>, ep_type: EndpointType,
+    fn alloc_ep(&mut self, ep_dir: EndpointDirection, ep_addr: Option<u8>, ep_type: EndpointType,
         max_packet_size: u16, _interval: u8) -> Result<u8>
     {
-        let mut pmem = self.packet_mem.borrow_mut();
-        let mut endpoints = self.endpoints.borrow_mut();
-
         let ep_addr = ep_addr.map(|a| (a & !0x80) as usize);
         let mut index = ep_addr.unwrap_or(1);
 
@@ -87,7 +91,7 @@ impl ::usb_device::bus::UsbBus for UsbBus {
                 return Err(UsbError::EndpointOverflow);
             }
 
-            let ep = &mut endpoints[index];
+            let ep = &mut self.endpoints[index];
 
             match ep.ep_type {
                 None => { ep.ep_type = Some(ep_type); },
@@ -99,8 +103,8 @@ impl ::usb_device::bus::UsbBus for UsbBus {
                 EndpointDirection::Out if !ep.out_valid => {
                     let (out_size, bits) = calculate_count_rx(max_packet_size as usize)?;
 
-                    let addr_rx = pmem.alloc(out_size)?;
-                    let bd = &pmem.descrs()[index];
+                    let addr_rx = self.packet_mem.alloc(out_size)?;
+                    let bd = &self.packet_mem.descrs()[index];
 
                     bd.addr_rx.set(addr_rx);
                     bd.count_rx.set(bits as usize);
@@ -110,8 +114,8 @@ impl ::usb_device::bus::UsbBus for UsbBus {
                     break;
                 },
                 EndpointDirection::In if !ep.in_valid => {
-                    let addr_tx = pmem.alloc(max_packet_size as usize)?;
-                    let bd = &pmem.descrs()[index];
+                    let addr_tx = self.packet_mem.alloc(max_packet_size as usize)?;
+                    let bd = &self.packet_mem.descrs()[index];
 
                     bd.addr_tx.set(addr_tx);
                     bd.count_tx.set(0);
@@ -128,18 +132,17 @@ impl ::usb_device::bus::UsbBus for UsbBus {
         Ok((index as u8) | (ep_dir as u8))
     }
 
-    fn enable(&self) {
+    fn enable(&mut self) {
+        //self.reset.freeze();
+
         let mut max = 0;
-        for (index, ep) in self.endpoints.borrow().iter().enumerate() {
+        for (index, ep) in self.endpoints.iter().enumerate() {
             if ep.out_valid || ep.in_valid {
                 max = index;
             }
         }
 
-        *self.max_endpoint.borrow_mut() = max;
-
-        self.max_endpoint.freeze();
-        self.endpoints.freeze();
+        self.max_endpoint = max;
 
         self.regs.cntr.modify(|_, w| w.pdwn().clear_bit());
 
@@ -153,154 +156,162 @@ impl ::usb_device::bus::UsbBus for UsbBus {
     }
 
     fn reset(&self) {
-        self.regs.istr.modify(|_, w| unsafe { w.bits(0) });
+        interrupt::free(|_| {
+            self.regs.istr.modify(|_, w| unsafe { w.bits(0) });
 
-        for (index, ep) in self.endpoints.borrow().iter().enumerate() {
-            let reg = &self.ep_regs()[index];
+            for (index, ep) in self.endpoints.iter().enumerate() {
+                let reg = &self.ep_regs()[index];
 
-            if let Some(ep_type) = ep.ep_type {
-                reg.configure(ep_type, index as u8);
+                if let Some(ep_type) = ep.ep_type {
+                    reg.configure(ep_type, index as u8);
 
-                if ep.out_valid {
-                    reg.set_stat_rx(EndpointStatus::Valid);
-                }
+                    if ep.out_valid {
+                        reg.set_stat_rx(EndpointStatus::Valid);
+                    }
 
-                if ep.in_valid {
-                    reg.set_stat_tx(EndpointStatus::Nak);
+                    if ep.in_valid {
+                        reg.set_stat_tx(EndpointStatus::Nak);
+                    }
                 }
             }
-        }
 
-        self.regs.daddr.modify(|_, w| unsafe { w.ef().set_bit().add().bits(0) });
+            self.regs.daddr.modify(|_, w| unsafe { w.ef().set_bit().add().bits(0) });
+        });
     }
 
     fn set_device_address(&self, addr: u8) {
-        self.regs.daddr.modify(|_, w| unsafe { w.add().bits(addr as u8) });
+        interrupt::free(|_| {
+            self.regs.daddr.modify(|_, w| unsafe { w.add().bits(addr as u8) });
+        });
     }
 
     fn poll(&self) -> PollResult {
-        let istr = self.regs.istr.read();
+        interrupt::free(|_| {
+            let istr = self.regs.istr.read();
 
-        if istr.wkup().bit_is_set() {
-            self.regs.istr.modify(|_, w| w.wkup().clear_bit());
+            if istr.wkup().bit_is_set() {
+                self.regs.istr.modify(|_, w| w.wkup().clear_bit());
 
-            let fnr = self.regs.fnr.read();
-            let bits = (fnr.rxdp().bit_is_set() as u8) << 1 | (fnr.rxdm().bit_is_set() as u8);
+                let fnr = self.regs.fnr.read();
+                let bits = (fnr.rxdp().bit_is_set() as u8) << 1 | (fnr.rxdm().bit_is_set() as u8);
 
-            match (fnr.rxdp().bit_is_set(), fnr.rxdm().bit_is_set()) {
-                (false, false) | (false, true) => {
-                    PollResult::Resume
-                },
-                _ => {
-                    // Spurious wakeup event caused by noise
-                    PollResult::Suspend
-                }
-            }
-        } else if istr.reset().bit_is_set() {
-            self.regs.istr.modify(|_, w| w.reset().clear_bit());
-
-            PollResult::Reset
-        } else if istr.susp().bit_is_set() {
-            self.regs.istr.modify(|_, w| w.susp().clear_bit());
-
-            PollResult::Suspend
-        } else if istr.ctr().bit_is_set() {
-            let mut ep_out = 0;
-            let mut ep_in_complete = 0;
-            let mut ep_setup = 0;
-            let mut bit = 1;
-
-            for reg in &self.ep_regs()[0..=*self.max_endpoint.borrow()] {
-                let v = reg.read();
-
-                if v.ctr_rx().bit_is_set() {
-                    ep_out |= bit;
-
-                    if v.setup().bit_is_set() {
-                        ep_setup |= bit;
+                match (fnr.rxdp().bit_is_set(), fnr.rxdm().bit_is_set()) {
+                    (false, false) | (false, true) => {
+                        PollResult::Resume
+                    },
+                    _ => {
+                        // Spurious wakeup event caused by noise
+                        PollResult::Suspend
                     }
                 }
+            } else if istr.reset().bit_is_set() {
+                self.regs.istr.modify(|_, w| w.reset().clear_bit());
 
-                if v.ctr_tx().bit_is_set() {
-                    ep_in_complete |= bit;
+                PollResult::Reset
+            } else if istr.susp().bit_is_set() {
+                self.regs.istr.modify(|_, w| w.susp().clear_bit());
 
-                    reg.clear_ctr_tx();
+                PollResult::Suspend
+            } else if istr.ctr().bit_is_set() {
+                let mut ep_out = 0;
+                let mut ep_in_complete = 0;
+                let mut ep_setup = 0;
+                let mut bit = 1;
+
+                for reg in &self.ep_regs()[0..=self.max_endpoint] {
+                    let v = reg.read();
+
+                    if v.ctr_rx().bit_is_set() {
+                        ep_out |= bit;
+
+                        if v.setup().bit_is_set() {
+                            ep_setup |= bit;
+                        }
+                    }
+
+                    if v.ctr_tx().bit_is_set() {
+                        ep_in_complete |= bit;
+
+                        reg.clear_ctr_tx();
+                    }
+
+                    bit <<= 1;
                 }
 
-                bit <<= 1;
+                PollResult::Data { ep_out, ep_in_complete, ep_setup }
+            } else {
+                PollResult::None
             }
-
-            PollResult::Data { ep_out, ep_in_complete, ep_setup }
-        } else {
-            PollResult::None
-        }
+        })
     }
 
     fn write(&self, ep_addr: u8, buf: &[u8]) -> Result<usize> {
-        if ep_addr & 0x80 == 0 {
-            return Err(UsbError::InvalidEndpoint);
-        }
+        interrupt::free(|_| {
+            if ep_addr & 0x80 == 0 {
+                return Err(UsbError::InvalidEndpoint);
+            }
 
-        let ep = ep_addr & !0x80;
+            let ep = ep_addr & !0x80;
 
-        if ep as usize >= NUM_ENDPOINTS {
-            return Err(UsbError::InvalidEndpoint);
-        }
+            if ep as usize >= NUM_ENDPOINTS {
+                return Err(UsbError::InvalidEndpoint);
+            }
 
-        let reg = &self.ep_regs()[ep as usize];
+            let reg = &self.ep_regs()[ep as usize];
 
-        match reg.read().stat_tx().bits().into() {
-            EndpointStatus::Valid => return Err(UsbError::Busy),
-            EndpointStatus::Disabled => return Err(UsbError::InvalidEndpoint),
-            _ => {},
-        };
+            match reg.read().stat_tx().bits().into() {
+                EndpointStatus::Valid => return Err(UsbError::Busy),
+                EndpointStatus::Disabled => return Err(UsbError::InvalidEndpoint),
+                _ => {},
+            };
 
-        let pmem = self.packet_mem.borrow();
-        let bd = &pmem.descrs()[ep as usize];
+            let bd = &self.packet_mem.descrs()[ep as usize];
 
-        // TODO: validate len
+            // TODO: validate len
 
-        pmem.write(bd.addr_tx.get(), buf);
-        bd.count_tx.set(buf.len());
+            self.packet_mem.write(bd.addr_tx.get(), buf);
+            bd.count_tx.set(buf.len());
 
-        reg.set_stat_tx(EndpointStatus::Valid);
+            reg.set_stat_tx(EndpointStatus::Valid);
 
-        Ok(buf.len())
+            Ok(buf.len())
+        })
     }
 
     fn read(&self, ep: u8, buf: &mut [u8]) -> Result<usize> {
-        if ep & 0x80 != 0 || ep as usize >= NUM_ENDPOINTS {
-            return Err(UsbError::InvalidEndpoint);
-        }
+        interrupt::free(|_| {
+            if ep & 0x80 != 0 || ep as usize >= NUM_ENDPOINTS {
+                return Err(UsbError::InvalidEndpoint);
+            }
 
-        let reg = &self.ep_regs()[ep as usize];
+            let reg = &self.ep_regs()[ep as usize];
 
-        let reg_v = reg.read();
+            let reg_v = reg.read();
 
-        let status: EndpointStatus = reg_v.stat_rx().bits().into();
+            let status: EndpointStatus = reg_v.stat_rx().bits().into();
 
-        if status == EndpointStatus::Disabled {
-            return Err(UsbError::InvalidEndpoint);
-        }
+            if status == EndpointStatus::Disabled {
+                return Err(UsbError::InvalidEndpoint);
+            }
 
-        if !reg_v.ctr_rx().bit_is_set() {
-            return Err(UsbError::NoData);
-        }
+            if !reg_v.ctr_rx().bit_is_set() {
+                return Err(UsbError::NoData);
+            }
 
-        let pmem = self.packet_mem.borrow();
-        let bd = &pmem.descrs()[ep as usize];
+            let bd = &self.packet_mem.descrs()[ep as usize];
 
-        let count = bd.count_rx.get() & 0x3f;
-        if count > buf.len() {
-            return Err(UsbError::BufferOverflow);
-        }
+            let count = bd.count_rx.get() & 0x3f;
+            if count > buf.len() {
+                return Err(UsbError::BufferOverflow);
+            }
 
-        pmem.read(bd.addr_rx.get(), buf);
+            self.packet_mem.read(bd.addr_rx.get(), buf);
 
-        reg.clear_ctr_rx();
-        reg.set_stat_rx(EndpointStatus::Valid);
+            reg.clear_ctr_rx();
+            reg.set_stat_rx(EndpointStatus::Valid);
 
-        return Ok(count)
+            return Ok(count)
+        })
     }
 
     fn stall(&self, ep: u8) {
@@ -310,7 +321,7 @@ impl ::usb_device::bus::UsbBus for UsbBus {
             } else {
                 self.ep_regs()[ep as usize].set_stat_rx(EndpointStatus::Stall);
             }
-        }
+        });
     }
 
     fn unstall(&self, ep: u8) {
@@ -326,7 +337,7 @@ impl ::usb_device::bus::UsbBus for UsbBus {
                     reg.set_stat_rx(EndpointStatus::Valid);
                 }
             }
-        }
+        });
     }
 
     fn suspend(&self) {
@@ -334,7 +345,7 @@ impl ::usb_device::bus::UsbBus for UsbBus {
             self.regs.cntr.modify(|_, w| w
                 .fsusp().set_bit()
                 .lpmode().set_bit());
-        }
+        });
     }
 
     fn resume(&self) {
@@ -344,24 +355,23 @@ impl ::usb_device::bus::UsbBus for UsbBus {
                 .lpmode().clear_bit());
         });
     }
-}
 
-/// Used for forcing a USB device reset and re-enumeration.
-pub struct UsbBusResetter<'a> {
-    bus: &'a UsbBus,
-    delay: u32,
-    pa12: gpioa::PA12<gpio::Output<gpio::PushPull>>,
-}
+    fn force_reset(&self) -> Result<()> {
+        interrupt::free(|_| {
+            match *self.reset.borrow() {
+                Some(ref reset) => {
+                    let pdwn = self.regs.cntr.read().pdwn().bit_is_set();
+                    self.regs.cntr.modify(|_, w| w.pdwn().set_bit());
 
-impl<'a> UsbBusResetter<'a> {
-    /// Force a USB device reset and re-enumeration.
-    pub fn reset(&mut self) {
-        let pdwn = self.bus.regs.cntr.read().pdwn().bit_is_set();
-        self.bus.regs.cntr.modify(|_, w| w.pdwn().set_bit());
+                    reset.pin.borrow_mut().set_low();
+                    delay(reset.delay);
 
-        self.pa12.set_low();
-        delay(self.delay);
+                    self.regs.cntr.modify(|_, w| w.pdwn().bit(pdwn));
 
-        self.bus.regs.cntr.modify(|_, w| w.pdwn().bit(pdwn));
+                    Ok(())
+                },
+                None => Err(UsbError::Unsupported),
+            }
+        })
     }
 }

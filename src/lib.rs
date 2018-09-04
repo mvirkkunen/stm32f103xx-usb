@@ -13,6 +13,7 @@ extern crate vcell;
 extern crate usb_device;
 
 mod regs;
+mod utils;
 
 /// USB peripheral driver.
 pub mod bus;
