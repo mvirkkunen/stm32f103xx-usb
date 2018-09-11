@@ -21,6 +21,7 @@ mod cdc_acm {
     use core::cell::RefCell;
     use core::cmp::min;
     use usb_device::class_prelude::*;
+    use usb_device::utils::AtomicMutex;
     use usb_device::Result;
 
     pub const USB_CLASS_CDC: u8 = 0x02;
@@ -42,17 +43,17 @@ mod cdc_acm {
         len: usize,
     }
 
-    pub struct SerialPort<'a, B: 'a + UsbBus> {
+    pub struct SerialPort<'a, B: 'a + UsbBus + Sync> {
         comm_if: InterfaceNumber,
         comm_ep: EndpointIn<'a, B>,
         data_if: InterfaceNumber,
         read_ep: EndpointOut<'a, B>,
         write_ep: EndpointIn<'a, B>,
 
-        read_buf: RefCell<Buf>,
+        read_buf: AtomicMutex<Buf>,
     }
 
-    impl<'a, B: UsbBus> SerialPort<'a, B> {
+    impl<'a, B: UsbBus + Sync> SerialPort<'a, B> {
         pub fn new(bus: &'a UsbBusWrapper<B>) -> SerialPort<'a, B> {
             SerialPort {
                 comm_if: bus.interface(),
@@ -60,7 +61,7 @@ mod cdc_acm {
                 data_if: bus.interface(),
                 read_ep: bus.bulk(64),
                 write_ep: bus.bulk(64),
-                read_buf: RefCell::new(Buf {
+                read_buf: AtomicMutex::new(Buf {
                     buf: [0; 64],
                     len: 0,
                 }),
@@ -76,7 +77,12 @@ mod cdc_acm {
         }
 
         pub fn read(&self, data: &mut [u8]) -> Result<usize> {
-            let mut buf = self.read_buf.borrow_mut();
+            let mut guard = self.read_buf.try_lock();
+
+            let buf = match guard {
+                Some(ref mut buf) => buf,
+                None => { return Ok(0) },
+            };
 
             // Terrible buffering implementation for brevity's sake
 
@@ -103,7 +109,7 @@ mod cdc_acm {
         }
     }
 
-    impl<'a, B: UsbBus> UsbClass for SerialPort<'a, B> {
+    impl<'a, B: UsbBus + Sync> UsbClass for SerialPort<'a, B> {
         fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> Result<()> {
             // TODO: make a better DescriptorWriter to make it harder to make invalid descriptors
             writer.interface(

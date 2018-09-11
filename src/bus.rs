@@ -314,30 +314,40 @@ impl ::usb_device::bus::UsbBus for UsbBus {
         })
     }
 
-    fn stall(&self, ep: u8) {
+    fn set_stalled(&self, ep: u8, stalled: bool) {
         interrupt::free(|_| {
-            if ep & 0x80 != 0 {
-                self.ep_regs()[(ep & !0x80) as usize].set_stat_tx(EndpointStatus::Stall);
-            } else {
-                self.ep_regs()[ep as usize].set_stat_rx(EndpointStatus::Stall);
+            if self.is_stalled(ep) == stalled {
+                return
             }
-        });
-    }
 
-    fn unstall(&self, ep: u8) {
-        interrupt::free(|_| {
             let reg = &self.ep_regs()[(ep & !0x80) as usize];
 
-            if ep & 0x80 != 0 {
-                if reg.read().stat_tx().bits() == EndpointStatus::Stall as u8 {
-                    reg.set_stat_tx(EndpointStatus::Nak);
+            if stalled {
+                if ep & 0x80 != 0 {
+                    reg.set_stat_tx(EndpointStatus::Stall);
+                } else {
+                    reg.set_stat_rx(EndpointStatus::Stall);
                 }
             } else {
-                if reg.read().stat_rx().bits() == EndpointStatus::Stall as u8 {
+                if ep & 0x80 != 0 {
+                    reg.set_stat_tx(EndpointStatus::Nak);
+                } else {
                     reg.set_stat_rx(EndpointStatus::Valid);
                 }
             }
         });
+    }
+
+    fn is_stalled(&self, ep: u8) -> bool {
+        interrupt::free(|_| {
+            let reg = &self.ep_regs()[(ep & !0x80) as usize];
+
+            if ep & 0x80 != 0 {
+                reg.read().stat_tx().bits() == EndpointStatus::Stall as u8
+            } else {
+                reg.read().stat_rx().bits() == EndpointStatus::Stall as u8
+            }
+        })
     }
 
     fn suspend(&self) {
