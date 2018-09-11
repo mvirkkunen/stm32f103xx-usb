@@ -18,7 +18,6 @@ use stm32f103xx_usb::UsbBus;
 
 // Minimal CDC-ACM implementation
 mod cdc_acm {
-    use core::cell::RefCell;
     use core::cmp::min;
     use usb_device::class_prelude::*;
     use usb_device::utils::AtomicMutex;
