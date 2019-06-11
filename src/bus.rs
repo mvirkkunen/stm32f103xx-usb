@@ -206,7 +206,6 @@ impl usb_device::bus::UsbBus for UsbBus {
             regs.istr.write(|w| unsafe { w.bits(0xffff) }.wkup().clear_bit() );
 
             let fnr = regs.fnr.read();
-            //let bits = (fnr.rxdp().bit_is_set() as u8) << 1 | (fnr.rxdm().bit_is_set() as u8);
 
             match (fnr.rxdp().bit_is_set(), fnr.rxdm().bit_is_set()) {
                 (false, false) | (false, true) => {
