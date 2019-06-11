@@ -203,6 +203,10 @@ impl Endpoint {
             return Err(UsbError::WouldBlock);
         }
 
+        interrupt::free(|cs| {
+            self.clear_ctr_rx(cs);
+        });
+
         let count = self.descr().count_rx.get() & 0x3ff;
         if count > buf.len() {
             return Err(UsbError::BufferOverflow);
@@ -211,7 +215,6 @@ impl Endpoint {
         self.read_mem(out_buf, &mut buf[0..count]);
 
         interrupt::free(|cs| {
-            self.clear_ctr_rx(cs);
             self.set_stat_rx(cs, EndpointStatus::Valid);
         });
 
